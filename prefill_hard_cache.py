@@ -16,8 +16,8 @@ Usage examples:
   python prefill_hard_cache.py --outfile hard_cache.json --max-file 300
 
 Requires:
-  - Sudoko.py in same directory (must expose generate_puzzle)
-  - numpy (imported by Sudoko)
+  - Sudoku.py in same directory (must expose generate_puzzle)
+  - numpy (imported by Sudoku)
 """
 
 from __future__ import annotations
@@ -32,16 +32,16 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # Import generation from your game module
 try:
-    from Sudoko import generate_puzzle
+    from Sudoku import generate_puzzle
 except Exception as e:
-    print("ERROR: Could not import generate_puzzle from Sudoko.py")
-    print("Make sure prefill_hard_cache.py is in the same directory as Sudoko.py")
+    print("ERROR: Could not import generate_puzzle from Sudoku.py")
+    print("Make sure prefill_hard_cache.py is in the same directory as Sudoku.py")
     raise
 
 # Try to pick a default outfile from your module; fall back to hard_cache.json
 DEFAULT_OUTFILE = "hard_cache.json"
 try:
-    from Sudoko import HARD_CACHE_FILE
+    from Sudoku import HARD_CACHE_FILE
     DEFAULT_OUTFILE = HARD_CACHE_FILE
 except Exception:
     pass
