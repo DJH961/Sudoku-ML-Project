@@ -11,6 +11,9 @@ License: MIT
 
 from __future__ import annotations
 import sys
+import threading
+import queue
+import atexit
 import os
 import json
 import time
@@ -51,6 +54,10 @@ TITLE_FONT_SIZE = 28
 
 # Best times storage
 STATS_FILE = "sudoku_stats.json"
+HARD_CACHE_FILE = "hard_cache.json"
+HARD_CACHE_MAX = 100
+HARD_CACHE_REFILL_THRESHOLD = 10
+CACHE_IO_LOCK = threading.Lock()
 
 # Difficulty strategy profiles
 DIFFICULTY_PROFILES = {
@@ -786,6 +793,91 @@ def get_best_time(difficulty: str) -> Optional[int]:
     return best_times.get(difficulty)
 
 # ----------------------------
+# Hard puzzle cache (disk-backed + background worker)
+# ----------------------------
+HARD_CACHE = queue.Queue(maxsize=HARD_CACHE_MAX)
+
+def preload_hard_cache_from_disk():
+    """Load up to HARD_CACHE_MAX puzzles from disk into the queue (if file exists)."""
+    try:
+        if os.path.exists(HARD_CACHE_FILE):
+            with open(HARD_CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # data is expected to be a list of {"puzzle": [[..]], "solution": [[..]]}
+            for item in data[:HARD_CACHE_MAX]:
+                try:
+                    HARD_CACHE.put_nowait((item["puzzle"], item["solution"]))
+                except queue.Full:
+                    break
+    except Exception as e:
+        print("Warning: failed to preload hard cache from disk:", e)
+
+def append_to_disk_cache(puzzle, solution):
+    """Append the newest puzzle to disk cache (front), keep only HARD_CACHE_MAX."""
+    try:
+        with CACHE_IO_LOCK:
+            data = []
+            if os.path.exists(HARD_CACHE_FILE):
+                try:
+                    with open(HARD_CACHE_FILE, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                except Exception:
+                    data = []
+            # Prepend newest
+            data.insert(0, {"puzzle": puzzle, "solution": solution})
+            data = data[:HARD_CACHE_MAX]
+            tmp = HARD_CACHE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp, HARD_CACHE_FILE)
+    except Exception as e:
+        print("Warning: failed to append hard cache to disk:", e)
+
+def hard_cache_worker():
+    """
+    Single background worker that keeps the cache warm.
+    - On startup: bring cache up to HARD_CACHE_REFILL_THRESHOLD quickly.
+    - Then trickle-fill up to HARD_CACHE_MAX.
+    Sleeps between iterations to avoid hogging CPU/GIL and UI jank.
+    """
+    while True:
+        try:
+            size = HARD_CACHE.qsize()
+            if size < HARD_CACHE_REFILL_THRESHOLD:
+                # Burst to the threshold
+                puzzle, solution = generate_puzzle("hard")
+                HARD_CACHE.put((puzzle, solution))
+                append_to_disk_cache(puzzle, solution)
+                time.sleep(0.01)  # yield CPU
+            elif size < HARD_CACHE_MAX:
+                # Trickle fill beyond threshold
+                time.sleep(0.2)   # be gentle
+                puzzle, solution = generate_puzzle("hard")
+                HARD_CACHE.put((puzzle, solution))
+                append_to_disk_cache(puzzle, solution)
+                time.sleep(0.05)
+            else:
+                # Full—sleep longer
+                time.sleep(0.8)
+        except Exception as e:
+            # On error, don't spin
+            time.sleep(0.5)
+
+# Initialize: load from disk first, then start ONE worker thread
+preload_hard_cache_from_disk()
+HARD_CACHE_THREAD = threading.Thread(target=hard_cache_worker, daemon=True)
+HARD_CACHE_THREAD.start()
+
+# Optional: flush queue snapshot at exit (not required, since we append on each gen)
+def _cleanup_cache_on_exit():
+    # No-op—append on each generation already keeps disk in sync
+    pass
+
+atexit.register(_cleanup_cache_on_exit)
+
+
+
+# ----------------------------
 # UI Engine with Pygame
 # ----------------------------
 
@@ -829,7 +921,16 @@ class Game:
     def reset(self, difficulty: Optional[str] = None) -> None:
         if difficulty is not None:
             self.difficulty = difficulty
-        self.puzzle, self.solution = generate_puzzle(self.difficulty)
+        if self.difficulty == "hard":
+            try:
+                self.puzzle, self.solution = HARD_CACHE.get_nowait()
+                
+            except queue.Empty:
+                # Fallback if cache empty
+                self.puzzle, self.solution = self.wait_for_hard_puzzle_modal()
+            
+        else:
+            self.puzzle, self.solution = generate_puzzle(self.difficulty)
         self.board = SudokuBoard(self.puzzle, self.solution)
         self.selected = None
         self.notes_mode = False
@@ -837,6 +938,48 @@ class Game:
         self.start_time = time.time()
         self.solved = False
         self.last_finish_time = None
+
+    def wait_for_hard_puzzle_modal(self):
+        """Blocks with a small in-UI 'Preparing puzzle...' overlay while the worker warms up."""
+        pygame = self.pygame
+        overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 120))
+        w, h = int(WIDTH * 0.7), 140
+        x, y = (WIDTH - w) // 2, (WIDTH - h) // 2
+        rect = pygame.Rect(x, y, w, h)
+        title = self.font_title.render("Please wait", True, (20, 20, 20))
+        msg = self.font_ui.render("Preparing a HARD puzzle...", True, (40, 40, 40))
+        dots = 0
+
+        while True:
+            # keep UI responsive
+            if self.clock:
+                self.clock.tick(30)
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    raise SystemExit
+
+            # Try to get a puzzle without blocking too long
+            try:
+                return HARD_CACHE.get(timeout=0.1)
+            except queue.Empty:
+                pass
+
+            # Draw base without flipping, then overlay once
+            self.draw(finalize=False)
+            self.screen.blit(overlay, (0, 0))
+            pygame.draw.rect(self.screen, (245, 245, 245), rect, border_radius=8)
+            pygame.draw.rect(self.screen, (70, 70, 70), rect, 2, border_radius=8)
+            self.screen.blit(title, (x + 16, y + 12))
+
+            # Simple '...' indicator
+            dots = (dots + 1) % 30
+            suffix = "." * (1 + (dots // 10))
+            t = self.font_ui.render("Preparing a HARD puzzle" + suffix, True, (40, 40, 40))
+            self.screen.blit(t, (x + 16, y + 60))
+
+            pygame.display.flip()
+
 
     # ---- Pygame ----
 
