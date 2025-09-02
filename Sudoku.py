@@ -1309,6 +1309,58 @@ class Game:
 # ML Docking: RL-friendly Environment
 # ----------------------------
 
+def get_cached_hard_puzzle(block: bool = False, timeout: float = 0.0):
+    """
+    Fetch one hard puzzle from the in-memory HARD_CACHE if available,
+    else pop from the disk cache (HARD_CACHE_FILE), else generate on the fly.
+    Returns (puzzle, solution).
+    """
+    # 1) Try in-memory queue
+    try:
+        q = globals().get("HARD_CACHE", None)
+        if q is not None:
+            if block:
+                puzzle, solution = q.get(timeout=timeout)
+            else:
+                puzzle, solution = q.get_nowait()
+            return puzzle, solution
+    except queue.Empty:
+        pass
+    except Exception:
+        pass
+
+    # 2) Try disk cache
+    path = globals().get("HARD_CACHE_FILE", "hard_cache.json")
+    lock = globals().get("CACHE_IO_LOCK", None)
+    acquired = False
+    try:
+        if lock:
+            lock.acquire()
+            acquired = True
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list) and data:
+                # Consume newest first (we stored newest at index 0)
+                item = data.pop(0)
+                tmp = path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(data, f)
+                os.replace(tmp, path)
+                return item["puzzle"], item["solution"]
+    except Exception:
+        pass
+    finally:
+        if acquired:
+            try:
+                lock.release()
+            except Exception:
+                pass
+
+    # 3) Fallback: generate on the fly
+    return generate_puzzle("hard")
+
+
 class SudokuEnv:
     """
     A minimal environment interface for ML/RL projects.
@@ -1325,9 +1377,22 @@ class SudokuEnv:
         * done = True if solved
         * info = {"mistakes": int, "valid": bool, "was_empty": bool}
     """
-    def __init__(self, difficulty: str = "medium"):
+    def __init__(self, difficulty: str = "medium",
+                 use_cache: bool = True,
+                 cache_block: bool = False,
+                 cache_timeout: float = 1.0):
+
         self.difficulty = difficulty
-        self.puzzle, self.solution = generate_puzzle(difficulty)
+        self.use_cache = use_cache
+        self.cache_block = cache_block
+        self.cache_timeout = cache_timeout
+        if self.difficulty == "hard" and self.use_cache:
+            self.puzzle, self.solution = get_cached_hard_puzzle(
+                block=self.cache_block, timeout=self.cache_timeout
+            )
+        else:
+            self.puzzle, self.solution = generate_puzzle(self.difficulty)
+
         self.board = SudokuBoard(self.puzzle, self.solution)
         self.mistakes = 0
         self.start_time = time.time()
@@ -1335,7 +1400,15 @@ class SudokuEnv:
     def reset(self, difficulty: Optional[str] = None) -> np.ndarray:
         if difficulty is not None:
             self.difficulty = difficulty
-        self.puzzle, self.solution = generate_puzzle(self.difficulty)
+
+        if self.difficulty == "hard" and getattr(self, "use_cache", True):
+            self.puzzle, self.solution = get_cached_hard_puzzle(
+                block=getattr(self, "cache_block", False),
+                timeout=getattr(self, "cache_timeout", 1.0)
+            )
+        else:
+            self.puzzle, self.solution = generate_puzzle(self.difficulty)
+
         self.board = SudokuBoard(self.puzzle, self.solution)
         self.mistakes = 0
         self.start_time = time.time()
@@ -1399,7 +1472,7 @@ class SudokuEnv:
 # ----------------------------
 
 def main():
-    # Simple CLI: python sudoku_pygame.py [easy|medium|hard]
+    # Simple CLI: python Sudoku.py [easy|medium|hard]
     diff = "medium"
     if len(sys.argv) >= 2 and sys.argv[1].lower() in ("easy", "medium", "hard"):
         diff = sys.argv[1].lower()
@@ -1415,7 +1488,7 @@ if __name__ == "__main__":
 
 """
 USAGE & CONTROLS (UI):
-- Run: python sudoku_pygame.py [easy|medium|hard]
+- Run: python Sudoku.py [easy|medium|hard]
 - Click a cell to select it.
 - Type 1..9 to place, 0/Del/Backspace to clear.
 - Press N to toggle Notes (pencil marks). With Notes ON, typing 1..9 toggles that note in the selected cell.
@@ -1429,7 +1502,7 @@ USAGE & CONTROLS (UI):
 
 ML DOCKING:
 - Import SudokuEnv from this file in Jupyter:
-    from sudoku_pygame import SudokuEnv
+    from Sudoku import SudokuEnv
     env = SudokuEnv('hard')
     obs = env.reset()
     # Take an action (r,c,v)
